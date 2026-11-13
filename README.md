@@ -1,10 +1,10 @@
 # MyFitnessPal Connector for Claude
 
 A small ASP.NET Core **remote MCP server** that lets Claude (including the Android app) read and write your
-MyFitnessPal diary. It runs on AWS Lambda behind a Function URL and is added to Claude as a **custom connector**.
+MyFitnessPal diary. It runs on AWS Lambda behind API Gateway at `myfitnesspal.jonathonwaterford.com`, and is added to Claude as a **custom connector**.
 
 ```
-Claude app ──MCP over HTTPS──> Lambda /mcp/{secret} ──(session cookie)──> www.myfitnesspal.com/api/...
+Claude app ──MCP over HTTPS──> API Gateway ──> Lambda /mcp/{secret} ──(session cookie)──> www.myfitnesspal.com/api/...
 ```
 
 ## Tools
@@ -61,4 +61,5 @@ MFP_LIVE_COOKIE="$(sed -n 's/^MFP_COOKIE=//p' .env)" dotnet test --filter Catego
 
 ## Deploy
 
-See [docs/DEPLOY.md](docs/DEPLOY.md).
+`./deploy.sh` uploads a new build to the existing Lambda. [docs/DEPLOY.md](docs/DEPLOY.md) lists the AWS resources, and covers
+maintenance and teardown.

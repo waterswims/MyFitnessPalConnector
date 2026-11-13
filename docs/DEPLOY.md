@@ -1,93 +1,57 @@
-# Deploying to AWS Lambda (console)
+# Deployment
 
-What you'll end up with: one Lambda function behind a Function URL, plus one SSM parameter that holds the MFP cookie.
-Use the same region throughout.
+Live at **`https://myfitnesspal.jonathonwaterford.com/mcp/<McpPathSecret>`** (AWS account 032621504602, region eu-west-2).
+The secret is in `MCP_PATH_SECRET` in your local `.env`, and in the Lambda's environment variables.
 
-## 1. Build the zip
+## Resources
 
-Requires the `zip` utility (`sudo pacman -S zip`).
+| Resource | Name |
+|---|---|
+| Lambda (.NET 10, arm64, 512 MB, 30 s) | `mfp-connector`; env vars `McpPathSecret`, `MfpCookieParameter`, `UserTimeZone` |
+| IAM role | `mfp-connector-lambda`: basic logging, plus `ssm:GetParameter`/`PutParameter` on the cookie parameter |
+| SSM parameter (SecureString) | `/mfp-connector/mfp-session`: the MFP session cookie; the Lambda saves renewed values back |
+| API Gateway HTTP API | `mfp-connector` (`a0i6uhabjd`): `$default` route → Lambda; the default `execute-api` endpoint is disabled |
+| API Gateway custom domain | `myfitnesspal.jonathonwaterford.com` (regional, TLS 1.2) |
+| ACM certificate | `myfitnesspal.jonathonwaterford.com` (DNS-validated, auto-renews) |
+| Route 53 (`jonathonwaterford.com`) | `A` alias → API Gateway domain; `CNAME` for ACM validation |
 
-```bash
-dotnet tool restore
-cd src/MfpConnector.Api
-dotnet lambda package -o ../../artifacts/mfp-connector.zip
-```
+API Gateway is used instead of a Lambda Function URL because Function URLs can't have custom domains.
 
-## 2. Store the MFP cookie
-
-1. In a desktop browser, sign in at myfitnesspal.com. Open DevTools → Application → Cookies →
-   `https://www.myfitnesspal.com` and copy the value of `__Secure-next-auth.session-token`.
-2. Console → **Systems Manager → Parameter Store → Create parameter**:
-   - **Name:** `/mfp-connector/mfp-session`
-   - **Type:** SecureString, with the default `alias/aws/ssm` key
-   - **Value:** the cookie
-
-## 3. IAM role
-
-Console → **IAM → Roles → Create role** → trusted entity **Lambda**.
-
-- Attach `AWSLambdaBasicExecutionRole`.
-- Add this inline policy, replacing `REGION` and `ACCOUNT_ID`. The server writes the renewed cookie back, which is why it needs `PutParameter`.
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [{
-    "Effect": "Allow",
-    "Action": ["ssm:GetParameter", "ssm:PutParameter"],
-    "Resource": "arn:aws:ssm:REGION:ACCOUNT_ID:parameter/mfp-connector/mfp-session"
-  }]
-}
-```
-
-## 4. Lambda function
-
-Console → **Lambda → Create function**:
-- **Runtime:** .NET 10
-- **Architecture:** arm64
-- **Execution role:** the role from step 3
-
-Then:
-
-1. **Code → Upload from → .zip file** → `artifacts/mfp-connector.zip`.
-2. **Runtime settings → Handler:** `MfpConnector.Api`.
-3. **Configuration → General:** 512 MB, 30 s timeout.
-4. **Configuration → Function URL → Create:** auth type **NONE**.
-5. **Configuration → Environment variables:**
-
-   | Key | Value |
-   |---|---|
-   | `McpPathSecret` | output of `openssl rand -hex 32` |
-   | `MfpCookieParameter` | `/mfp-connector/mfp-session` |
-   | `UserTimeZone` | e.g. `Europe/London` |
-   | `AllowedSourceCidrs` | optional; see below |
-
-## 5. Add the connector to Claude
+## Add the connector to Claude
 
 1. On claude.ai (web), go to **Settings → Connectors → Add custom connector**.
-2. Set the URL to `https://<function-url>/mcp/<McpPathSecret>`. Leave the OAuth fields empty.
+2. Set the URL to `https://myfitnesspal.jonathonwaterford.com/mcp/<MCP_PATH_SECRET from .env>`. Leave the OAuth fields empty.
 3. In the Android app, enable the connector in a chat. Connectors added on the web sync to mobile.
 
-Try: "What have I eaten today?", "Log my usual porridge for breakfast", "Log my weight as 82.4 kg".
+## Updating the code
 
-## Optional: restrict source IPs
-
-Set `AllowedSourceCidrs` to a comma-separated list of CIDR ranges, e.g. the egress IP addresses Anthropic publishes
-for MCP connector traffic (look up the current list in Anthropic's docs). Requests from any other address get a 404,
-so a leaked URL alone isn't enough. Leave it unset to allow any address.
+```bash
+aws login --region eu-west-2   # if the session has expired
+./deploy.sh                    # dotnet publish → zip → aws lambda update-function-code
+```
 
 ## Maintenance
 
-- **Session expired** (Claude will tell you): copy a fresh cookie (step 2.1) and update the SSM parameter's value.
-  The next tool call picks it up.
-- **Updating the code:** rebuild the zip, then use **Code → Upload from → .zip file**.
-- **Revoking access:** change `McpPathSecret`, then update the connector URL in Claude.
+- **MFP session expired** (Claude will tell you): sign in at myfitnesspal.com, copy the
+  `__Secure-next-auth.session-token` cookie (DevTools → Application → Cookies), then:
+  `aws ssm put-parameter --region eu-west-2 --name /mfp-connector/mfp-session --type SecureString --overwrite --value '<cookie>'`
+- **Revoking access:** set a new `McpPathSecret` on the Lambda (`openssl rand -hex 32`), then update the connector URL in Claude.
+- **Restricting source IPs (optional):** add a Lambda env var `AllowedSourceCidrs` with comma-separated CIDR ranges, e.g.
+  the egress IP addresses Anthropic publishes for MCP connector traffic (check Anthropic's docs for the current list).
+- **Logs:** `aws logs tail /aws/lambda/mfp-connector --region eu-west-2 --since 1h`
 
-## Troubleshooting
+## Tearing it down
 
-- **"Cloudflare protection blocked this server":** MFP is challenging requests from AWS IP addresses. Requests from a home
-  connection weren't challenged during testing. Your options are to send MFP calls through a proxy, or to host elsewhere.
-- **No .NET 10 runtime in your region:** add `"msbuild-parameters": "--self-contained true"` to
-  `aws-lambda-tools-defaults.json` and `<AssemblyName>bootstrap</AssemblyName>` to the `.csproj`. Then use the
-  `provided.al2023` runtime with handler `bootstrap`.
-- **Logs:** Lambda → Monitor → View CloudWatch logs.
+```bash
+export AWS_REGION=eu-west-2
+aws apigatewayv2 delete-domain-name --domain-name myfitnesspal.jonathonwaterford.com
+aws apigatewayv2 delete-api --api-id a0i6uhabjd
+aws lambda delete-function --function-name mfp-connector
+aws iam delete-role-policy --role-name mfp-connector-lambda --policy-name mfp-session-parameter
+aws iam detach-role-policy --role-name mfp-connector-lambda --policy-arn arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+aws iam delete-role --role-name mfp-connector-lambda
+aws ssm delete-parameter --name /mfp-connector/mfp-session
+aws acm delete-certificate --certificate-arn arn:aws:acm:eu-west-2:032621504602:certificate/1435c42e-30fc-46c8-b414-281789560030
+aws logs delete-log-group --log-group-name /aws/lambda/mfp-connector
+# Then delete the myfitnesspal A record and the ACM validation CNAME from the jonathonwaterford.com hosted zone.
+```
